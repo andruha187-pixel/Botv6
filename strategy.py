@@ -34,15 +34,29 @@ from models import BookSide, Market, Portfolio
 
 EPSILON = 1e-9
 
-# Между 90 и 30 секундами разрешается строгий добор
-# исходной стороны, только если её цена сильно снизилась.
-LATE_SAME_SIDE_PRICE_DROP = 0.08
+# Защитная работа начинается не позже чем за 150 секунд.
+AGGRESSIVE_RESCUE_WINDOW_SEC = max(
+    150.0,
+    float(DEFENSIVE_PAIR_WINDOW_SEC),
+)
 
-# Максимальное ухудшение worst PnL при таком доборе.
+# Добор исходной стороны разрешён, когда цена минимум
+# на 6 центов ниже средней цены этой стороны.
+LATE_SAME_SIDE_AVERAGE_PRICE_DROP = 0.06
+
+# Максимальное допустимое ухудшение Worst PnL
+# при доборе исходной стороны.
 LATE_SAME_SIDE_MAX_WORST_DETERIORATION = 0.20
 
-# В последние 30 секунд исходную сторону больше не покупаем.
+# Последние 30 секунд исходную сторону не добираем.
 LATE_SAME_SIDE_STOP_BEFORE_END_SEC = 30.0
+
+# Последние 25 секунд снимается ограничение pair_sum,
+# если противоположная покупка уменьшает Worst PnL.
+TRUE_EMERGENCY_WINDOW_SEC = 25.0
+
+# В защитном режиме покупки могут выполняться чаще.
+RESCUE_MIN_SECONDS_BETWEEN_TRADES = 3.0
 
 
 @dataclass(slots=True)
@@ -79,31 +93,22 @@ def _clone(portfolio: Portfolio) -> Portfolio:
     return Portfolio(
         condition_id=portfolio.condition_id,
         coin=portfolio.coin,
-
         up_qty=portfolio.up_qty,
         down_qty=portfolio.down_qty,
-
         up_spent=portfolio.up_spent,
         down_spent=portfolio.down_spent,
-
         last_trade_timestamp=portfolio.last_trade_timestamp,
-
         trade_count=portfolio.trade_count,
         cycle_count=portfolio.cycle_count,
-
         up_buy_count=portfolio.up_buy_count,
         down_buy_count=portfolio.down_buy_count,
-
         anchor_side=portfolio.anchor_side,
         anchor_timestamp=portfolio.anchor_timestamp,
         anchor_price=portfolio.anchor_price,
-
         best_up_ask_seen=portfolio.best_up_ask_seen,
         best_down_ask_seen=portfolio.best_down_ask_seen,
-
         last_up_buy_price=portfolio.last_up_buy_price,
         last_down_buy_price=portfolio.last_down_buy_price,
-
         finalized=portfolio.finalized,
     )
 
@@ -301,14 +306,26 @@ def _book_for_side(
     return down
 
 
-def _last_buy_price(
+def _side_average_price(
     portfolio: Portfolio,
     side: str,
 ) -> float | None:
     if side == "UP":
-        return portfolio.last_up_buy_price
+        if portfolio.up_qty <= EPSILON:
+            return None
 
-    return portfolio.last_down_buy_price
+        return (
+            portfolio.up_spent
+            / portfolio.up_qty
+        )
+
+    if portfolio.down_qty <= EPSILON:
+        return None
+
+    return (
+        portfolio.down_spent
+        / portfolio.down_qty
+    )
 
 
 def _anchor_decisions(
@@ -379,7 +396,9 @@ def _anchor_decisions(
         ):
             continue
 
-        value = 1.0 - price
+        value = (
+            1.0 - price
+        )
 
         pair_bonus = max(
             0.0,
@@ -447,13 +466,19 @@ def _new_cycle_decisions(
         return []
 
     seconds_left = (
-        market.end_timestamp - now
+        market.end_timestamp
+        - now
     )
 
-    if (
-        seconds_left
-        <= NEW_CYCLE_STOP_BEFORE_END_SEC
-    ):
+    # В последние 150 секунд новые циклы запрещены.
+    new_cycle_stop = max(
+        float(
+            NEW_CYCLE_STOP_BEFORE_END_SEC
+        ),
+        AGGRESSIVE_RESCUE_WINDOW_SEC,
+    )
+
+    if seconds_left <= new_cycle_stop:
         return []
 
     decisions: list[Decision] = []
@@ -572,7 +597,17 @@ def _new_cycle_decisions(
 
 def _pair_limit(
     seconds_left: float,
-) -> tuple[str, float]:
+) -> tuple[str, float | None]:
+    # В последние 25 секунд ограничение суммы пары снимается.
+    if (
+        seconds_left
+        <= TRUE_EMERGENCY_WINDOW_SEC
+    ):
+        return (
+            "TRUE_EMERGENCY_PAIR",
+            None,
+        )
+
     if (
         seconds_left
         <= EMERGENCY_PAIR_WINDOW_SEC
@@ -584,7 +619,7 @@ def _pair_limit(
 
     if (
         seconds_left
-        <= DEFENSIVE_PAIR_WINDOW_SEC
+        <= AGGRESSIVE_RESCUE_WINDOW_SEC
     ):
         return (
             "DEFENSIVE_PAIR",
@@ -611,18 +646,20 @@ def _pair_decisions(
         return []
 
     seconds_left = (
-        market.end_timestamp - now
+        market.end_timestamp
+        - now
     )
 
     waited = (
-        now - portfolio.anchor_timestamp
+        now
+        - portfolio.anchor_timestamp
     )
 
     if (
         waited
         < MIN_SECONDS_AFTER_ANCHOR_FOR_PAIR
         and seconds_left
-        > DEFENSIVE_PAIR_WINDOW_SEC
+        > AGGRESSIVE_RESCUE_WINDOW_SEC
     ):
         return []
 
@@ -633,9 +670,9 @@ def _pair_decisions(
     )
 
     book = _book_for_side(
-        opposite_side,
-        up,
-        down,
+        side=opposite_side,
+        up=up,
+        down=down,
     )
 
     if not _valid_book(book):
@@ -661,13 +698,10 @@ def _pair_decisions(
         quantity=quantity,
     )
 
-    # До 90 секунд действует обычный лимит.
-    # В последние 90 секунд разрешено использовать до $45,
-    # но только для противоположной стороны.
     capital_limit = (
         EMERGENCY_MARKET_CAPITAL_USDC
         if seconds_left
-        <= DEFENSIVE_PAIR_WINDOW_SEC
+        <= AGGRESSIVE_RESCUE_WINDOW_SEC
         else MAX_MARKET_CAPITAL_USDC
     )
 
@@ -680,14 +714,14 @@ def _pair_decisions(
     up_average = (
         candidate.up_spent
         / candidate.up_qty
-        if candidate.up_qty > 0
+        if candidate.up_qty > EPSILON
         else 0.0
     )
 
     down_average = (
         candidate.down_spent
         / candidate.down_qty
-        if candidate.down_qty > 0
+        if candidate.down_qty > EPSILON
         else 0.0
     )
 
@@ -700,12 +734,6 @@ def _pair_decisions(
         seconds_left=seconds_left
     )
 
-    if (
-        pair_sum
-        > allowed_pair_sum
-    ):
-        return []
-
     worst_improvement = (
         candidate.worst_pnl
         - portfolio.worst_pnl
@@ -716,15 +744,24 @@ def _pair_decisions(
         - candidate.unpaired_qty
     )
 
-    if worst_improvement <= 0:
+    if worst_improvement <= EPSILON:
         return []
 
     if unpaired_reduction <= EPSILON:
         return []
 
+    # До последних 25 секунд сумма пары ограничена.
+    # В последние 25 секунд достаточно улучшения Worst PnL.
+    if (
+        allowed_pair_sum is not None
+        and pair_sum > allowed_pair_sum
+    ):
+        return []
+
     target_bonus = max(
         0.0,
-        PAIR_TARGET_SUM - pair_sum,
+        PAIR_TARGET_SUM
+        - pair_sum,
     ) * 5.0
 
     urgency_bonus = 0.0
@@ -732,8 +769,11 @@ def _pair_decisions(
     if action == "DEFENSIVE_PAIR":
         urgency_bonus = 2.0
 
-    if action == "EMERGENCY_PAIR":
+    elif action == "EMERGENCY_PAIR":
         urgency_bonus = 4.0
+
+    elif action == "TRUE_EMERGENCY_PAIR":
+        urgency_bonus = 8.0
 
     score = (
         worst_improvement * 1.50
@@ -741,6 +781,12 @@ def _pair_decisions(
         + target_bonus
         + urgency_bonus
         - float(book.spread)
+    )
+
+    allowed_text = (
+        "NO_LIMIT"
+        if allowed_pair_sum is None
+        else f"{allowed_pair_sum:.4f}"
     )
 
     return [
@@ -753,7 +799,7 @@ def _pair_decisions(
             reason=(
                 f"{action}; "
                 f"pair_sum={pair_sum:.4f}; "
-                f"allowed_sum={allowed_pair_sum:.4f}; "
+                f"allowed_sum={allowed_text}; "
                 f"qty={quantity:.2f}; "
                 f"min_size={book.min_order_size:.2f}; "
                 f"notional=${price * quantity:.2f}; "
@@ -763,6 +809,7 @@ def _pair_decisions(
                 f"->{candidate.unpaired_qty:.2f}; "
                 f"worst={portfolio.worst_pnl:+.3f}"
                 f"->{candidate.worst_pnl:+.3f}; "
+                f"improvement={worst_improvement:+.3f}; "
                 f"seconds_left={seconds_left:.1f}; "
                 f"waited={waited:.1f}s"
             ),
@@ -779,22 +826,24 @@ def _late_same_side_decisions(
     down: BookSide,
 ) -> list[Decision]:
     """
-    Между 90 и 30 секундами разрешает строгий добор
-    исходной стороны, если её цена сильно снизилась.
+    Между 150 и 30 секундами разрешает строгий добор
+    исходной стороны.
 
-    Последние 30 секунд добор исходной стороны запрещён.
+    Добор разрешён только если цена заметно ниже средней
+    цены всей позиции этой стороны.
     """
 
     if portfolio.unpaired_side is None:
         return []
 
     seconds_left = (
-        market.end_timestamp - now
+        market.end_timestamp
+        - now
     )
 
     if (
         seconds_left
-        > DEFENSIVE_PAIR_WINDOW_SEC
+        > AGGRESSIVE_RESCUE_WINDOW_SEC
     ):
         return []
 
@@ -807,9 +856,9 @@ def _late_same_side_decisions(
     side = portfolio.unpaired_side
 
     book = _book_for_side(
-        side,
-        up,
-        down,
+        side=side,
+        up=up,
+        down=down,
     )
 
     if not _valid_book(book):
@@ -817,24 +866,23 @@ def _late_same_side_decisions(
 
     price = float(book.ask)
 
-    last_price = _last_buy_price(
-        portfolio,
-        side,
+    average_price = _side_average_price(
+        portfolio=portfolio,
+        side=side,
     )
 
-    if last_price is None:
+    if average_price is None:
         return []
 
     price_drop = (
-        last_price - price
+        average_price
+        - price
     )
 
-    required_drop = max(
-        LATE_SAME_SIDE_PRICE_DROP,
-        0.08,
-    )
-
-    if price_drop < required_drop:
+    if (
+        price_drop
+        < LATE_SAME_SIDE_AVERAGE_PRICE_DROP
+    ):
         return []
 
     quantity = _minimum_quantity(
@@ -852,8 +900,7 @@ def _late_same_side_decisions(
         quantity=quantity,
     )
 
-    # Аварийный лимит нельзя использовать
-    # для увеличения исходной стороны.
+    # Аварийный капитал для исходной стороны запрещён.
     if (
         candidate.total_spent
         > MAX_MARKET_CAPITAL_USDC
@@ -877,8 +924,22 @@ def _late_same_side_decisions(
     ):
         return []
 
-    # Низкий score специально:
-    # противоположная сторона всегда имеет приоритет.
+    # Не разрешаем слишком сильно увеличивать непарный остаток.
+    maximum_allowed_unpaired = max(
+        float(
+            PAPER_LOTS[portfolio.coin]
+        ) * 2.0,
+        portfolio.unpaired_qty * 1.35,
+    )
+
+    if (
+        candidate.unpaired_qty
+        > maximum_allowed_unpaired
+    ):
+        return []
+
+    # Низкий score оставлен специально:
+    # закрытие противоположной стороной всегда приоритетнее.
     score = (
         price_drop * 1.50
         - worst_deterioration * 2.0
@@ -896,11 +957,13 @@ def _late_same_side_decisions(
             reason=(
                 f"LATE_SAME_SIDE; "
                 f"seconds_left={seconds_left:.1f}; "
-                f"last_price={last_price:.4f}; "
+                f"average_price={average_price:.4f}; "
                 f"ask={price:.4f}; "
                 f"price_drop={price_drop:.4f}; "
                 f"qty={quantity:.2f}; "
                 f"notional=${price * quantity:.2f}; "
+                f"unpaired={portfolio.unpaired_qty:.2f}"
+                f"->{candidate.unpaired_qty:.2f}; "
                 f"worst={portfolio.worst_pnl:+.3f}"
                 f"->{candidate.worst_pnl:+.3f}; "
                 f"deterioration={worst_deterioration:.3f}"
@@ -931,11 +994,13 @@ def choose_decision(
     )
 
     market_second = (
-        now - market.start_timestamp
+        now
+        - market.start_timestamp
     )
 
     seconds_left = (
-        market.end_timestamp - now
+        market.end_timestamp
+        - now
     )
 
     if (
@@ -950,11 +1015,10 @@ def choose_decision(
     ):
         return None
 
-    # За 90 секунд пересчитываем позицию чаще.
     minimum_trade_delay = (
-        3.0
+        RESCUE_MIN_SECONDS_BETWEEN_TRADES
         if seconds_left
-        <= DEFENSIVE_PAIR_WINDOW_SEC
+        <= AGGRESSIVE_RESCUE_WINDOW_SEC
         else MIN_SECONDS_BETWEEN_TRADES
     )
 
@@ -967,9 +1031,12 @@ def choose_decision(
 
     candidates: list[Decision] = []
 
-    # Когда есть непарная позиция,
-    # противоположная сторона проверяется первой.
-    if portfolio.unpaired_qty > EPSILON:
+    # Если есть непарный остаток, сначала всегда пытаемся
+    # купить противоположную сторону.
+    if (
+        portfolio.unpaired_qty
+        > EPSILON
+    ):
         pair_candidates = _pair_decisions(
             now=now,
             market=market,
@@ -984,14 +1051,17 @@ def choose_decision(
                 key=lambda item: item.score,
             )
 
-        # Между 90 и 30 секундами допускается строгий
-        # добор исходной стороны, если цена сильно снизилась.
-        same_side_candidates = _late_same_side_decisions(
-            now=now,
-            market=market,
-            portfolio=portfolio,
-            up=up,
-            down=down,
+        # Если прямо сейчас закрыть пару нельзя,
+        # между 150 и 30 секундами можно выгодно
+        # усреднить исходную сторону.
+        same_side_candidates = (
+            _late_same_side_decisions(
+                now=now,
+                market=market,
+                portfolio=portfolio,
+                up=up,
+                down=down,
+            )
         )
 
         return max(
@@ -1000,8 +1070,7 @@ def choose_decision(
             default=None,
         )
 
-    # Эти ограничения относятся только к новым входам.
-    # Закрытие пары проверяется выше и может использовать $45.
+    # Ограничения ниже относятся только к новым входам.
     if (
         portfolio.total_spent
         >= MAX_MARKET_CAPITAL_USDC
@@ -1022,6 +1091,7 @@ def choose_decision(
                 down=down,
             )
         )
+
     else:
         candidates.extend(
             _new_cycle_decisions(
@@ -1098,9 +1168,17 @@ def apply_decision(
         "PAIR_LOCK",
         "DEFENSIVE_PAIR",
         "EMERGENCY_PAIR",
+        "TRUE_EMERGENCY_PAIR",
     }:
-        portfolio.cycle_count += 1
+        # Цикл закрывается только если после покупки
+        # непарный остаток действительно исчез.
+        if (
+            portfolio.unpaired_qty
+            <= EPSILON
+        ):
+            portfolio.cycle_count += 1
 
-        portfolio.anchor_side = None
-        portfolio.anchor_timestamp = 0.0
-        portfolio.anchor_price = None
+            portfolio.anchor_side = None
+            portfolio.anchor_timestamp = 0.0
+            portfolio.anchor_price = None     
+ 
